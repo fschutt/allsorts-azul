@@ -132,6 +132,7 @@ mod crc32;
 pub mod context;
 pub mod error;
 pub mod font;
+pub mod font_builder;
 pub mod font_data;
 #[cfg(feature = "specimen")]
 pub mod font_specimen;
