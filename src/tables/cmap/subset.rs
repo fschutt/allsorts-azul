@@ -141,7 +141,7 @@ impl<'a> CmapSubtableFormat4Segment<'a> {
 }
 
 impl owned::CmapSubtableFormat4 {
-    fn from_mappings(
+    pub(crate) fn from_mappings(
         mappings: &MappingsToKeep<NewIds>,
     ) -> Result<owned::CmapSubtableFormat4, ParseError> {
         let mut table = owned::CmapSubtableFormat4 {
@@ -223,7 +223,7 @@ impl owned::CmapSubtableFormat4 {
 }
 
 impl owned::CmapSubtableFormat12 {
-    fn from_mappings(mappings: &MappingsToKeep<NewIds>) -> owned::CmapSubtableFormat12 {
+    pub(crate) fn from_mappings(mappings: &MappingsToKeep<NewIds>) -> owned::CmapSubtableFormat12 {
         let mut segments = Vec::new();
         if let Some((start, gid)) = mappings.iter().next() {
             let mut segment = SequentialMapGroup {
@@ -332,6 +332,26 @@ impl<T> MappingsToKeep<T> {
 
     fn plane(&self) -> CharExistence {
         self.plane
+    }
+}
+
+impl MappingsToKeep<NewIds> {
+    /// The mappings of a font that is built from scratch, whose glyph ids are final already.
+    pub(crate) fn from_new_ids(mappings: impl IntoIterator<Item = (char, u16)>) -> Self {
+        let mut plane = CharExistence::MacRoman;
+        let mappings = mappings
+            .into_iter()
+            .map(|(ch, glyph_id)| {
+                let ch = Character::Unicode(ch);
+                plane = plane.max(ch.existence());
+                (ch, glyph_id)
+            })
+            .collect();
+        MappingsToKeep {
+            mappings,
+            plane,
+            _ids: PhantomData,
+        }
     }
 }
 

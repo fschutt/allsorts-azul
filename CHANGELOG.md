@@ -6,6 +6,12 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 ## [Unreleased]
 
+### Added
+
+- `font_builder`: build a TrueType font from scratch out of glyph outlines,
+  advance widths and character mappings (`TrueTypeBuilder`, `Outline`). Cubic
+  curves are converted to quadratic ones.
+
 ## [0.17.0] - 2026-05-07
 
 ### Added
