@@ -6,6 +6,20 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-11-20 (allsorts-azul)
+
+Azul's fork, `allsorts-azul` 0.17.3 (upstream 0.17.0 plus the fork's changes).
+
+### Fixed
+
+- Fix a composite glyph's component that is itself composite losing the offset and
+  scale that placed it: the nested component was drawn at its own origin, so the
+  accents of `Ö` and `ü` in Barlow sat left of the letter instead of over it.
+- Indic: a multi-part vowel sign that was not decomposed (text that was not
+  preprocessed) takes the position of its last part, as in HarfBuzz, instead of
+  reaching the mark tagging without a position and panicking (Bengali "যশোর"; the
+  same signs of Oriya, Tamil, Telugu, Kannada, Malayalam and Sinhala).
+
 ## [0.17.0] - 2026-05-07
 
 ### Added
