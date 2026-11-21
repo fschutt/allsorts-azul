@@ -615,7 +615,9 @@ fn create_hmtx_table<'b>(
             // As an optimization, the number of records can be less than the number of glyphs, in which case the
             // advance width value of the last record applies to all remaining glyph IDs.
             // https://docs.microsoft.com/en-us/typography/opentype/spec/hmtx
-            let mut metric = hmtx.h_metrics.read_item(num_h_metrics - 1)?;
+            // numberOfHMetrics is 0 in a corrupt font, which has no last record to repeat.
+            let last = num_h_metrics.checked_sub(1).ok_or(ParseError::BadIndex)?;
+            let mut metric = hmtx.h_metrics.read_item(last)?;
             metric.lsb = hmtx.left_side_bearings.read_item(old_id - num_h_metrics)?;
             h_metrics.push(metric);
         }

@@ -1480,9 +1480,14 @@ impl FDSelect<'_> {
 impl<'a> Index<'a> {
     fn read_object(&self, index: usize) -> Option<&[u8]> {
         if index < self.count {
-            let start_index = lookup_offset_index(self.off_size, self.offset_array, index) - 1;
-            let end_index = lookup_offset_index(self.off_size, self.offset_array, index + 1) - 1;
-            Some(&self.data_array[start_index..end_index])
+            // The offsets are 1-based and only the last one is checked when the INDEX is
+            // read, so a corrupt font can hold 0, a start after the end, or an end past
+            // the data. Such an object does not exist.
+            let start_index =
+                lookup_offset_index(self.off_size, self.offset_array, index).checked_sub(1)?;
+            let end_index =
+                lookup_offset_index(self.off_size, self.offset_array, index + 1).checked_sub(1)?;
+            self.data_array.get(start_index..end_index)
         } else {
             None
         }
@@ -1498,8 +1503,9 @@ impl<'a> Index<'a> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
-        // NOTE(unwrap): Safe since we're iterating over valid indices
-        (0..self.count).map(move |i| self.read_object(i).unwrap())
+        // An object that is not valid (see `read_object`) is empty, so the indices of the
+        // other objects stay the same.
+        (0..self.count).map(move |i| self.read_object(i).unwrap_or_default())
     }
 
     /// Returns the length required to write `objects`.
@@ -3379,6 +3385,67 @@ mod tests {
             expected,
             f64::EPSILON
         );
+    }
+
+    /// The objects of an INDEX with 1 byte offsets. `data` holds `last offset - 1` bytes, as
+    /// `read_index` requires, but the other offsets are not checked there.
+    fn index_objects(offsets: &[u8], data: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let index = Index {
+            count: offsets.len() - 1,
+            off_size: 1,
+            offset_array: offsets,
+            data_array: data,
+        };
+        (0..index.count)
+            .map(|i| index.read_object(i).map(<[u8]>::to_vec))
+            .collect()
+    }
+
+    #[test]
+    fn index_with_valid_offsets() {
+        assert_eq!(
+            index_objects(&[1, 2, 3], &[4, 5]),
+            vec![Some(vec![4]), Some(vec![5])]
+        );
+    }
+
+    #[test]
+    fn index_object_with_offset_zero_is_missing() {
+        // Offsets are 1-based: 0 made `offset - 1` overflow.
+        assert_eq!(
+            index_objects(&[0, 1, 3], &[4, 5]),
+            vec![None, Some(vec![4, 5])]
+        );
+    }
+
+    #[test]
+    fn index_object_with_start_after_end_is_missing() {
+        // The first object would run from 2 to 0 (after the -1): the range was sliced.
+        assert_eq!(
+            index_objects(&[3, 1, 3], &[4, 5]),
+            vec![None, Some(vec![4, 5])]
+        );
+    }
+
+    #[test]
+    fn index_object_that_ends_past_the_data_is_missing() {
+        // The data holds 2 bytes (last offset 3). The first object ends at 8, the second
+        // starts there.
+        assert_eq!(index_objects(&[1, 9, 3], &[4, 5]), vec![None, None]);
+    }
+
+    #[test]
+    fn iterating_a_corrupt_index_gives_empty_objects() {
+        let offsets = [0, 1, 3];
+        let data = [4, 5];
+        let index = Index {
+            count: 2,
+            off_size: 1,
+            offset_array: &offsets,
+            data_array: &data,
+        };
+        let objects: Vec<&[u8]> = index.iter().collect();
+        assert_eq!(objects, vec![&[][..], &[4, 5][..]]);
     }
 
     #[test]

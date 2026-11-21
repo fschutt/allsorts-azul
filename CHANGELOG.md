@@ -6,6 +6,22 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-11-21 (allsorts-azul)
+
+Panics on corrupt fonts, found by mutating font files. Each is an error now, or a
+missing object, and has a test.
+
+### Fixed
+
+- Fix a panic in `cff::Index` for an object with a bad offset. Offsets are 1-based and
+  only the last one was checked, so an offset of 0 overflowed, and a start after the end
+  or an end past the data sliced out of range. Such an object is missing, and iterating
+  the INDEX gives an empty object for it.
+- Fix a panic in `Font::cmap_subtable_data` when the cmap record that was chosen points
+  past the cmap table. `Font::new` returns `ParseError::BadOffset` for that font.
+- Fix an overflow in `subset` for a font whose `numberOfHMetrics` is 0: it subtracted 1
+  from it. The subset returns an error.
+
 ## [0.17.3] - 2026-11-20 (allsorts-azul)
 
 Azul's fork, `allsorts-azul` 0.17.3 (upstream 0.17.0 plus the fork's changes).
