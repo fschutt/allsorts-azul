@@ -127,6 +127,15 @@ pub fn instance(
     provider: &impl FontTableProvider,
     user_instance: &[Fixed],
 ) -> Result<(Vec<u8>, OwnedTuple), VariationError> {
+    instance_with_threads(provider, user_instance, None)
+}
+
+/// [`instance`] with the number of threads the glyphs are varied by (`None`: as many as the font is worth).
+fn instance_with_threads(
+    provider: &impl FontTableProvider,
+    user_instance: &[Fixed],
+    threads: Option<usize>,
+) -> Result<(Vec<u8>, OwnedTuple), VariationError> {
     is_supported_variable_font(provider)?;
 
     // We need to create a font with at least these tables:
@@ -250,6 +259,7 @@ pub fn instance(
                 Some(&os2),
                 &hhea,
                 &instance,
+                threads,
             )?;
 
             // Update head
@@ -896,6 +906,66 @@ fn htmx_from_phantom_points<'a>(
 /// during processing (see note in body of function) and returning early would
 /// leave the `glyf` table in an incorrect state. So we consume it and return
 /// the modified, valid result only on success.
+/// A font of at least this many glyphs has its variations applied by several threads.
+const PARALLEL_GLYPHS: usize = 512;
+
+/// Varies `records` (the glyphs of a `glyf` table from glyph 0 on) in `threads` ranges of consecutive glyphs. The
+/// result does not depend on `threads`: no glyph reads another one (a composite glyph's bounding box is
+/// calculated in a pass of its own, after this one). An error is the one of the first range that has one.
+fn apply_gvar_to_records<'a>(
+    records: &mut [GlyfRecord<'a>],
+    threads: usize,
+    gvar: &GvarTable<'a>,
+    hmtx: &HmtxTable<'a>,
+    vmtx: Option<&HmtxTable<'a>>,
+    os2: Option<&Os2>,
+    hhea: &HheaTable,
+    instance: &OwnedTuple,
+) -> Result<(), ReadWriteError> {
+    fn range<'a>(
+        records: &mut [GlyfRecord<'a>],
+        first_glyph: usize,
+        gvar: &GvarTable<'a>,
+        hmtx: &HmtxTable<'a>,
+        vmtx: Option<&HmtxTable<'a>>,
+        os2: Option<&Os2>,
+        hhea: &HheaTable,
+        instance: &OwnedTuple,
+    ) -> Result<(), ReadWriteError> {
+        for (offset, glyph_record) in records.iter_mut().enumerate() {
+            // NOTE(cast): Safe as num_glyphs is u16
+            let glyph_id = (first_glyph + offset) as u16;
+            glyph_record.parse()?;
+            match glyph_record {
+                GlyfRecord::Parsed(glyph) => {
+                    glyph.apply_variations(glyph_id, instance, gvar, hmtx, vmtx, os2, hhea)?;
+                }
+                GlyfRecord::Present { .. } => unreachable!("glyph should be parsed"),
+            }
+        }
+        Ok(())
+    }
+
+    if threads <= 1 || records.len() < 2 {
+        return range(records, 0, gvar, hmtx, vmtx, os2, hhea, instance);
+    }
+    let per_thread = records.len().div_ceil(threads);
+    let outcomes: Vec<Result<(), ReadWriteError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = records
+            .chunks_mut(per_thread)
+            .enumerate()
+            .map(|(n, chunk)| {
+                scope.spawn(move || range(chunk, n * per_thread, gvar, hmtx, vmtx, os2, hhea, instance))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+            .collect()
+    });
+    outcomes.into_iter().collect()
+}
+
 fn apply_gvar<'a>(
     mut glyf: GlyfTable<'a>,
     gvar: &GvarTable<'a>,
@@ -904,18 +974,19 @@ fn apply_gvar<'a>(
     os2: Option<&Os2>,
     hhea: &HheaTable,
     instance: &OwnedTuple,
+    threads: Option<usize>,
 ) -> Result<GlyfTable<'a>, ReadWriteError> {
-    for (glyph_id, glyph_record) in glyf.records_mut().iter_mut().enumerate() {
-        // NOTE(cast): Safe as num_glyphs is u16
-        let glyph_id = glyph_id as u16;
-        glyph_record.parse()?;
-        match glyph_record {
-            GlyfRecord::Parsed(glyph) => {
-                glyph.apply_variations(glyph_id, instance, gvar, hmtx, vmtx, os2, hhea)?;
-            }
-            GlyfRecord::Present { .. } => unreachable!("glyph should be parsed"),
+    // Each glyph is varied on its own (its deltas, its phantom points), so the records go in ranges, one
+    // thread each; a font with few glyphs is not worth a thread.
+    let records = glyf.records_mut();
+    let threads = threads.unwrap_or_else(|| {
+        if records.len() >= PARALLEL_GLYPHS {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+        } else {
+            1
         }
-    }
+    });
+    apply_gvar_to_records(records, threads, gvar, hmtx, vmtx, os2, hhea, instance)?;
 
     // Do a pass to update the bounding boxes of composite glyphs
     for glyph_id in 0..glyf.num_glyphs() {
@@ -1308,6 +1379,42 @@ mod tests {
         assert!(instance(&table_provider, &user_tuple).is_ok());
 
         Ok(())
+    }
+
+    #[test]
+    fn varying_the_glyphs_in_ranges_gives_the_same_font() {
+        for path in [
+            "tests/fonts/opentype/NotoSans-VF.abc.ttf",
+            "tests/fonts/variable/Inter[slnt,wght].abc.ttf",
+            "tests/fonts/variable/UnderlineTest-VF.ttf",
+        ] {
+            let buffer = read_fixture(path);
+            let scope = ReadScope::new(&buffer);
+            let font_file = scope.read::<FontData<'_>>().unwrap();
+            let provider = font_file.table_provider(0).unwrap();
+            let fvar_data = provider.read_table_data(tag::FVAR).unwrap();
+            let fvar = ReadScope::new(&fvar_data).read::<FvarTable<'_>>().unwrap();
+            // A point 37 percent into every axis: not the default, so the glyphs have deltas.
+            let user: Vec<Fixed> = fvar
+                .axes()
+                .map(|axis| {
+                    let (min, max) = (f32::from(axis.min_value), f32::from(axis.max_value));
+                    Fixed::from(min + (max - min) * 0.37)
+                })
+                .collect();
+            let (sequential, _) = instance_with_threads(&provider, &user, Some(1)).unwrap();
+            assert!(!sequential.is_empty());
+            for threads in [2, 3, 4, 8] {
+                let (ranged, _) = instance_with_threads(&provider, &user, Some(threads)).unwrap();
+                assert!(
+                    ranged == sequential,
+                    "{path}: {threads} threads make another font than one"
+                );
+            }
+            // The default is the same font again, whatever the number of threads.
+            let (made, _) = instance(&provider, &user).unwrap();
+            assert!(made == sequential, "{path}: instance() is not the sequential font");
+        }
     }
 
     #[test]

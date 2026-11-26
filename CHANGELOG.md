@@ -6,6 +6,12 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 ## [Unreleased]
 
+### Changed
+
+- `variations::instance` varies the glyphs of a `glyf` font on up to eight threads when the font has 512 glyphs or
+  more (each glyph is varied on its own, so the font is the same bytes whatever the number of threads). A static
+  instance of macOS's `SFNS.ttf` (2,935 glyphs) takes 3.8 ms on eight cores instead of 9.0 ms.
+
 ## [0.17.4] - 2026-11-21 (allsorts-azul)
 
 Panics on corrupt fonts, found by mutating font files. Each is an error now, or a
