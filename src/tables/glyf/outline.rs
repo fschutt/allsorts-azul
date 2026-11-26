@@ -208,30 +208,45 @@ pub struct VariableGlyfContextStore<'a> {
     os2: Cow<'a, [u8]>,
 }
 
+/// Where the glyph being visited sits in the glyph that was asked for.
+///
+/// `transform` maps the visited glyph's points into the coordinates of the outermost glyph: the
+/// product of the transforms of every composite component on the way down. A component that is
+/// itself composite hands its own transform on to its children, so an accent built from two dots
+/// (`dieresiscomb`) placed over a letter (`Ö` = `O` + `dieresiscomb`) has its dots where the
+/// letter's component put the accent, not at the accent's own origin.
 #[derive(Copy, Clone)]
 struct GlyfVisitorState {
-    offset: Vector2F,
-    scale: Option<CompositeGlyphScale>,
+    transform: Transform2F,
     depth: u8,
 }
 
 impl GlyfVisitorState {
     fn new() -> Self {
         GlyfVisitorState {
-            offset: Vector2F::zero(),
-            scale: None,
+            transform: Transform2F::default(),
             depth: 0,
         }
     }
 
-    fn transform(&self) -> Transform2F {
-        let scale = self
-            .scale
-            .map_or_else(|| Matrix2x2F::from_scale(1.0), Matrix2x2F::from);
-        Transform2F {
-            vector: self.offset,
+    /// The state of `component` of the composite glyph visited in this state.
+    fn component(&self, offset: Vector2F, scale: Option<CompositeGlyphScale>) -> Self {
+        let scale = scale.map_or_else(|| Matrix2x2F::from_scale(1.0), Matrix2x2F::from);
+        // The component's own transform: its points scaled, then moved by its offset (the
+        // offset is not scaled: UNSCALED_COMPONENT_OFFSET, the Microsoft default). Applied
+        // first, before the transform that places this glyph in its own parent.
+        let component = Transform2F {
+            vector: offset,
             matrix: scale,
+        };
+        GlyfVisitorState {
+            transform: self.transform * component,
+            depth: self.depth + 1,
         }
+    }
+
+    fn transform(&self) -> Transform2F {
+        self.transform
     }
 }
 
@@ -280,7 +295,7 @@ impl<'a, 'data> GlyfVisitorContext<'a, 'data> {
                 visit_simple_glyph_outline(sink, state.transform(), simple_glyph)
             }
             Glyph::Composite(composite) => {
-                self.visit_composite_glyph_outline(sink, &composite.glyphs, tuple, state.depth)
+                self.visit_composite_glyph_outline(sink, &composite.glyphs, tuple, state)
             }
         }
     }
@@ -290,7 +305,7 @@ impl<'a, 'data> GlyfVisitorContext<'a, 'data> {
         sink: &mut S,
         glyphs: &[CompositeGlyphComponent],
         tuple: Option<&OwnedTuple>,
-        depth: u8,
+        state: GlyfVisitorState,
     ) -> Result<(), ParseError> {
         for composite_glyph in glyphs {
             // Argument1 and argument2 can be either x and y offsets to be added to the glyph (the
@@ -311,13 +326,11 @@ impl<'a, 'data> GlyfVisitorContext<'a, 'data> {
                 // TODO: support args as point numbers
                 Vector2F::zero()
             };
-            let state = GlyfVisitorState {
-                offset,
-                scale: composite_glyph.scale,
-                depth: depth + 1,
-            };
+            // The child is placed by this component AND by everything that placed this glyph:
+            // a composite inside a composite keeps its parent's offset and scale.
+            let child = state.component(offset, composite_glyph.scale);
 
-            self.visit_outline(composite_glyph.glyph_index, tuple, state, sink)?;
+            self.visit_outline(composite_glyph.glyph_index, tuple, child, sink)?;
         }
 
         Ok(())
@@ -579,7 +592,11 @@ mod tests {
     use crate::binary::read::ReadScope;
     use crate::binary::write::{WriteBinaryDep, WriteBuffer};
     use crate::tables::glyf::tests::{composite_glyph_fixture, simple_glyph_fixture};
-    use crate::tables::glyf::{GlyfRecord, GlyfTable, Point, SimpleGlyphFlag, SimpleGlyphFlags};
+    use crate::tables::glyf::{
+        BoundingBox, CompositeGlyph, CompositeGlyphArgument, CompositeGlyphFlag, GlyfRecord,
+        GlyfTable, Point, SimpleGlyphFlag, SimpleGlyphFlags,
+    };
+    use crate::tables::F2Dot14;
     use crate::tables::variable_fonts::avar::AvarTable;
     use crate::tables::variable_fonts::fvar::FvarTable;
     use crate::tables::{Fixed, IndexToLocFormat, OpenTypeFont};
@@ -688,6 +705,160 @@ mod tests {
         context
             .visit(1, None, &mut visitor)
             .expect("error visiting glyph outline");
+    }
+
+    /// Records the points an outline visit produces, contour by contour.
+    #[derive(Default)]
+    struct PointRecorder {
+        contours: Vec<Vec<(f32, f32)>>,
+    }
+
+    impl OutlineSink for PointRecorder {
+        fn move_to(&mut self, to: Vector2F) {
+            self.contours.push(vec![(to.x(), to.y())]);
+        }
+
+        fn line_to(&mut self, to: Vector2F) {
+            self.contours.last_mut().unwrap().push((to.x(), to.y()));
+        }
+
+        fn quadratic_curve_to(&mut self, control: Vector2F, to: Vector2F) {
+            let contour = self.contours.last_mut().unwrap();
+            contour.push((control.x(), control.y()));
+            contour.push((to.x(), to.y()));
+        }
+
+        fn cubic_curve_to(&mut self, control: LineSegment2F, to: Vector2F) {
+            let contour = self.contours.last_mut().unwrap();
+            contour.push((control.from_x(), control.from_y()));
+            contour.push((control.to_x(), control.to_y()));
+            contour.push((to.x(), to.y()));
+        }
+
+        fn close(&mut self) {}
+    }
+
+    /// A square of `size` font units with its lower left corner at the origin.
+    fn square_glyph(size: i16) -> Glyph {
+        let on = SimpleGlyphFlags::from(SimpleGlyphFlag::ON_CURVE_POINT);
+        Glyph::Simple(SimpleGlyph {
+            bounding_box: BoundingBox {
+                x_min: 0,
+                x_max: size,
+                y_min: 0,
+                y_max: size,
+            },
+            end_pts_of_contours: vec![3],
+            instructions: Box::default(),
+            coordinates: vec![
+                (on, Point(0, 0)),
+                (on, Point(size, 0)),
+                (on, Point(size, size)),
+                (on, Point(0, size)),
+            ],
+            phantom_points: None,
+        })
+    }
+
+    /// A composite glyph of `components`: (glyph index, x offset, y offset, scale).
+    fn composite_glyph(components: &[(u16, i16, i16, Option<f32>)]) -> Glyph {
+        let glyphs = components
+            .iter()
+            .enumerate()
+            .map(|(i, &(glyph_index, x, y, scale))| {
+                let mut flags = CompositeGlyphFlag::ARG_1_AND_2_ARE_WORDS
+                    | CompositeGlyphFlag::ARGS_ARE_XY_VALUES;
+                if i + 1 < components.len() {
+                    flags |= CompositeGlyphFlag::MORE_COMPONENTS;
+                }
+                if scale.is_some() {
+                    flags |= CompositeGlyphFlag::WE_HAVE_A_SCALE;
+                }
+                CompositeGlyphComponent {
+                    flags,
+                    glyph_index,
+                    argument1: CompositeGlyphArgument::I16(x),
+                    argument2: CompositeGlyphArgument::I16(y),
+                    scale: scale.map(|s| CompositeGlyphScale::Scale(F2Dot14::from(s))),
+                }
+            })
+            .collect();
+        Glyph::Composite(CompositeGlyph {
+            bounding_box: BoundingBox::empty(),
+            glyphs,
+            instructions: Box::default(),
+            phantom_points: None,
+        })
+    }
+
+    fn visit_points(loca_glyf: &mut LocaGlyf, glyph_index: u16) -> Vec<Vec<(f32, f32)>> {
+        let mut recorder = PointRecorder::default();
+        GlyfVisitorContext::new(loca_glyf, None)
+            .visit(glyph_index, None, &mut recorder)
+            .expect("error visiting glyph outline");
+        recorder.contours
+    }
+
+    /// The first point of each contour: where each square of the glyph starts.
+    fn contour_origins(contours: &[Vec<(f32, f32)>]) -> Vec<(f32, f32)> {
+        contours.iter().map(|contour| contour[0]).collect()
+    }
+
+    /// A component that is itself composite keeps the offset and scale of the component that
+    /// placed it. Barlow's `Ö` is `O` + `dieresiscomb` at an offset, and `dieresiscomb` is two
+    /// `dotaccent`s: the dots were drawn at the accent's own origin (left of and inside the
+    /// letter) because only their own offsets reached them.
+    #[test]
+    fn nested_composite_glyphs_compose_their_transforms() {
+        // 0: a dot, 1: two dots 30 apart (the combining dieresis), 2: the base letter,
+        // 3: the letter with the dieresis over it, 4: the dieresis at half size,
+        // 5: the half-size dieresis placed again (three levels deep).
+        let glyphs = GlyfTable {
+            records: vec![
+                GlyfRecord::Parsed(square_glyph(10)),
+                GlyfRecord::Parsed(composite_glyph(&[(0, 0, 0, None), (0, 30, 0, None)])),
+                GlyfRecord::Parsed(square_glyph(100)),
+                GlyfRecord::Parsed(composite_glyph(&[(2, 0, 0, None), (1, 200, 500, None)])),
+                GlyfRecord::Parsed(composite_glyph(&[(1, 10, 20, Some(0.5))])),
+                GlyfRecord::Parsed(composite_glyph(&[(4, 1000, 0, None)])),
+            ],
+        };
+        let mut buf = WriteBuffer::new();
+        let loca = GlyfTable::write_dep(&mut buf, glyphs, IndexToLocFormat::Long)
+            .expect("unable to write glyf table");
+        let mut loca_glyf = LocaGlyf::loaded(loca, buf.into_inner().into_boxed_slice());
+
+        // The dieresis on its own: the dots at their own offsets.
+        assert_eq!(
+            contour_origins(&visit_points(&mut loca_glyf, 1)),
+            vec![(0., 0.), (30., 0.)]
+        );
+
+        // Over the letter: both dots moved by the dieresis' offset (200, 500).
+        let o_dieresis = visit_points(&mut loca_glyf, 3);
+        assert_eq!(
+            contour_origins(&o_dieresis),
+            vec![(0., 0.), (200., 500.), (230., 500.)]
+        );
+        assert_eq!(
+            o_dieresis[2],
+            vec![(230., 500.), (240., 500.), (240., 510.), (230., 510.)]
+        );
+
+        // A scaled component scales what is inside it, the inner offsets too: the second dot
+        // starts at 10 + 0.5 * 30 and is 5 units wide.
+        let half = visit_points(&mut loca_glyf, 4);
+        assert_eq!(contour_origins(&half), vec![(10., 20.), (25., 20.)]);
+        assert_eq!(
+            half[1],
+            vec![(25., 20.), (30., 20.), (30., 25.), (25., 25.)]
+        );
+
+        // Three levels: the outer offset is added to everything below it.
+        assert_eq!(
+            contour_origins(&visit_points(&mut loca_glyf, 5)),
+            vec![(1010., 20.), (1025., 20.)]
+        );
     }
 
     #[test]

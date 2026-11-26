@@ -1986,3 +1986,124 @@ mod bad {
         }
     }
 }
+
+/// Text that was not preprocessed (`preprocess_text`): a vowel sign drawn in
+/// two parts reaches the shaper whole. Every Indic script's multi-part vowel
+/// sign used to leave its glyph without a position, and the mark tagging
+/// asserted that every glyph had one (`left != right`): azul-layout shaped
+/// "যশোর" (Jessore) so and panicked. Such a sign now takes the position of
+/// its last part, as in HarfBuzz.
+#[cfg(test)]
+mod unpreprocessed {
+    use super::*;
+
+    /// `text` mapped one glyph per char, as it stands, and shaped.
+    fn shape_raw(font_path: &str, script: &str, text: &str) -> Result<Vec<u16>, ShapingError> {
+        let font_buffer = common::read_fixture_font(font_path);
+        let opentype_file = ReadScope::new(&font_buffer)
+            .read::<OpenTypeFont<'_>>()
+            .unwrap();
+        let provider = opentype_file.table_provider(0).unwrap();
+        let mut font = Font::new(Box::new(provider)).unwrap();
+        let cmap_subtable_data = font.cmap_subtable_data().to_vec();
+        let cmap_subtable = ReadScope::new(&cmap_subtable_data)
+            .read::<CmapSubtable<'_>>()
+            .unwrap();
+        let mut glyphs: Vec<RawGlyph<()>> = text
+            .chars()
+            .filter_map(|ch| shape::map_glyph(&cmap_subtable, ch).unwrap())
+            .collect();
+        let gsub_cache = font.gsub_cache().unwrap().unwrap();
+        let gdef_table = font.gdef_table().unwrap();
+        let dotted_circle = cmap_subtable.map_glyph(DOTTED_CIRCLE as u32)?.unwrap_or(0);
+        gsub::apply(
+            dotted_circle,
+            &gsub_cache,
+            gdef_table.as_ref().map(Arc::as_ref),
+            tag::from_string(script).unwrap(),
+            None,
+            FeatureMask::default_mask(),
+            &[],
+            None,
+            font.num_glyphs(),
+            &mut glyphs,
+        )?;
+        Ok(glyphs.iter().map(|g| g.glyph_index).collect())
+    }
+
+    fn glyph(font_path: &str, ch: char) -> u16 {
+        let font_buffer = common::read_fixture_font(font_path);
+        let opentype_file = ReadScope::new(&font_buffer)
+            .read::<OpenTypeFont<'_>>()
+            .unwrap();
+        let provider = opentype_file.table_provider(0).unwrap();
+        let font = Font::new(Box::new(provider)).unwrap();
+        let data = font.cmap_subtable_data().to_vec();
+        let cmap = ReadScope::new(&data).read::<CmapSubtable<'_>>().unwrap();
+        cmap.map_glyph(ch as u32).unwrap().unwrap()
+    }
+
+    #[test]
+    fn jessore_with_the_o_sign_whole() {
+        let font = "noto/NotoSansBengali-Regular.ttf";
+        // ya, sha, o sign, ra
+        let ids = shape_raw(font, "beng", "\u{09AF}\u{09B6}\u{09CB}\u{09B0}").expect("shapes");
+        // The sign whole, after its consonant (its last part's position).
+        assert_eq!(
+            ids,
+            [
+                glyph(font, '\u{09AF}'),
+                glyph(font, '\u{09B6}'),
+                glyph(font, '\u{09CB}'),
+                glyph(font, '\u{09B0}')
+            ]
+        );
+    }
+
+    /// Every multi-part vowel sign of every Indic script, after a consonant,
+    /// not decomposed: shaped, not a panic.
+    #[test]
+    fn every_multi_part_vowel_sign_shapes_whole() {
+        let cases: &[(&str, &str, char, &[char])] = &[
+            ("noto/NotoSansBengali-Regular.ttf", "beng", '\u{0995}', &['\u{09CB}', '\u{09CC}']),
+            (
+                "noto/NotoSansOriya-Regular.ttf",
+                "orya",
+                '\u{0B15}',
+                &['\u{0B48}', '\u{0B4B}', '\u{0B4C}'],
+            ),
+            (
+                "noto/NotoSansTamil-Regular.ttf",
+                "taml",
+                '\u{0B95}',
+                &['\u{0BCA}', '\u{0BCB}', '\u{0BCC}'],
+            ),
+            ("noto/NotoSansTelugu-Regular.ttf", "telu", '\u{0C15}', &['\u{0C48}']),
+            (
+                "noto/NotoSansKannada-Regular.ttf",
+                "knda",
+                '\u{0C95}',
+                &['\u{0CC0}', '\u{0CC7}', '\u{0CC8}', '\u{0CCA}', '\u{0CCB}'],
+            ),
+            (
+                "noto/NotoSansMalayalam-Regular.ttf",
+                "mlym",
+                '\u{0D15}',
+                &['\u{0D4A}', '\u{0D4B}', '\u{0D4C}'],
+            ),
+            (
+                "noto/NotoSansSinhala-Regular.ttf",
+                "sinh",
+                '\u{0D9A}',
+                &['\u{0DDA}', '\u{0DDC}', '\u{0DDD}', '\u{0DDE}'],
+            ),
+        ];
+        for (font, script, consonant, signs) in cases {
+            for sign in *signs {
+                let text: String = [*consonant, *sign].iter().collect();
+                let result = shape_raw(font, script, &text);
+                assert!(result.is_ok(), "{script} {text:?}: {result:?}");
+            }
+        }
+    }
+}

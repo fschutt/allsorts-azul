@@ -153,6 +153,23 @@ impl Script {
         }
     }
 
+    /// The right-side position of a multi-part matra whose script gives
+    /// [`Self::rightside_matra_pos`] for its single-part matras only
+    /// (HarfBuzz's `MATRA_POS_RIGHT`).
+    fn split_matra_right_pos(self, ch: char) -> Pos {
+        match self {
+            Script::Telugu if ch <= '\u{0C42}' => Pos::BeforeSubjoined,
+            Script::Kannada if !('\u{0CC3}'..='\u{0CD6}').contains(&ch) => Pos::BeforeSubjoined,
+            Script::Bengali
+            | Script::Gurmukhi
+            | Script::Gujarati
+            | Script::Oriya
+            | Script::Tamil
+            | Script::Malayalam => Pos::AfterPost,
+            _ => Pos::AfterSubjoined,
+        }
+    }
+
     fn belowbase_matra_pos(self) -> Pos {
         match self {
             Script::Devanagari => Pos::AfterSubjoined,
@@ -1890,7 +1907,23 @@ fn matra_pos(c: char, script: Script) -> Option<Pos> {
             MarkPlacementSubclass::RightPosition => script.rightside_matra_pos(c),
             MarkPlacementSubclass::BottomPosition => Some(script.belowbase_matra_pos()),
             MarkPlacementSubclass::LeftPosition => Some(Pos::PrebaseMatra),
-            _ => None,
+            // A multi-part matra is decomposed into its parts by
+            // `preprocess_indic`. One that is not - the caller did not
+            // preprocess the text, or it has no canonical decomposition -
+            // takes the position of its last part, as in HarfBuzz
+            // (`gen-indic-table.py`: "These should resolve to the position of
+            // the last part of the split sequence"). Without a position it
+            // reached the mark tagging untagged and failed its assertion.
+            MarkPlacementSubclass::LeftAndRightPosition
+            | MarkPlacementSubclass::TopAndRightPosition
+            | MarkPlacementSubclass::TopLeftAndRightPosition => {
+                script.rightside_matra_pos(c).or(Some(script.split_matra_right_pos(c)))
+            }
+            MarkPlacementSubclass::TopAndLeftPosition => script
+                .abovebase_matra_pos()
+                .or(Some(Pos::AfterSubjoined)),
+            MarkPlacementSubclass::TopAndBottomPosition => Some(script.belowbase_matra_pos()),
+            MarkPlacementSubclass::Overstruck => Some(Pos::AfterMain),
         },
         _ => None,
     }
@@ -3734,10 +3767,30 @@ mod tests {
             assert_eq!(matra_pos('\u{0B57}', Script::Oriya), Some(Pos::AfterPost));
         }
 
+        /// A multi-part matra the text was not preprocessed for takes the
+        /// position of its last part, as in HarfBuzz.
         #[test]
         fn test_non_decomposed_matra() {
-            // Should never happen
-            assert_eq!(matra_pos('\u{09CB}', Script::Bengali), None);
+            // Bengali O, AU: left + right
+            assert_eq!(matra_pos('\u{09CB}', Script::Bengali), Some(Pos::AfterPost));
+            assert_eq!(matra_pos('\u{09CC}', Script::Bengali), Some(Pos::AfterPost));
+            // Oriya AI: left + top; O: left + right
+            assert_eq!(matra_pos('\u{0B48}', Script::Oriya), Some(Pos::AfterMain));
+            assert_eq!(matra_pos('\u{0B4B}', Script::Oriya), Some(Pos::AfterPost));
+            // Tamil O
+            assert_eq!(matra_pos('\u{0BCA}', Script::Tamil), Some(Pos::AfterPost));
+            // Telugu AI: top + bottom
+            assert_eq!(matra_pos('\u{0C48}', Script::Telugu), Some(Pos::BeforeSubjoined));
+            // Kannada II, E+..: top + right
+            assert_eq!(matra_pos('\u{0CC0}', Script::Kannada), Some(Pos::BeforeSubjoined));
+            assert_eq!(matra_pos('\u{0CC7}', Script::Kannada), Some(Pos::AfterSubjoined));
+            assert_eq!(matra_pos('\u{0CCA}', Script::Kannada), Some(Pos::AfterSubjoined));
+            // Malayalam O
+            assert_eq!(matra_pos('\u{0D4A}', Script::Malayalam), Some(Pos::AfterPost));
+            // Sinhala E, O, AU
+            assert_eq!(matra_pos('\u{0DDA}', Script::Sinhala), Some(Pos::AfterSubjoined));
+            assert_eq!(matra_pos('\u{0DDC}', Script::Sinhala), Some(Pos::AfterSubjoined));
+            assert_eq!(matra_pos('\u{0DDE}', Script::Sinhala), Some(Pos::AfterSubjoined));
         }
 
         #[test]

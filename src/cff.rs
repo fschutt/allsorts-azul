@@ -11,11 +11,8 @@ mod subset;
 use std::io::Write;
 use std::iter;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
 
-use byteorder::{BigEndian, ByteOrder};
-use itertools::Itertools;
-use lazy_static::lazy_static;
-use num_traits as num;
 use tinyvec::{array_vec, tiny_vec, TinyVec};
 
 use crate::binary::read::{
@@ -44,19 +41,6 @@ const OFFSET_ZERO: [Operand; 1] = [Operand::Offset(0)];
 const DEFAULT_UNDERLINE_POSITION: [Operand; 1] = [Operand::Integer(-100)];
 const DEFAULT_UNDERLINE_THICKNESS: [Operand; 1] = [Operand::Integer(50)];
 const DEFAULT_CHARSTRING_TYPE: [Operand; 1] = [Operand::Integer(2)];
-lazy_static! {
-    static ref DEFAULT_FONT_MATRIX: [Operand; 6] = {
-        let real_0_001 = Operand::Real(Real(tiny_vec![0x0a, 0x00, 0x1f])); // 0.001
-        [
-            real_0_001.clone(),
-            Operand::Integer(0),
-            Operand::Integer(0),
-            real_0_001,
-            Operand::Integer(0),
-            Operand::Integer(0),
-        ]
-    };
-}
 const DEFAULT_BBOX: [Operand; 4] = [
     Operand::Integer(0),
     Operand::Integer(0),
@@ -66,11 +50,34 @@ const DEFAULT_BBOX: [Operand; 4] = [
 const DEFAULT_CID_COUNT: [Operand; 1] = [Operand::Integer(8720)];
 const DEFAULT_BLUE_SHIFT: [Operand; 1] = [Operand::Integer(7)];
 const DEFAULT_BLUE_FUZZ: [Operand; 1] = [Operand::Integer(1)];
-lazy_static! {
-    static ref DEFAULT_BLUE_SCALE: [Operand; 1] =
-        [Operand::Real(Real(tiny_vec![0x0a, 0x03, 0x96, 0x25, 0xff]))]; // 0.039625
-    static ref DEFAULT_EXPANSION_FACTOR: [Operand; 1] =
-        [Operand::Real(Real(tiny_vec![0x0a, 0x06, 0xff]))]; // 0.06
+
+// Operands containing `Real` values can't be const because `Real` wraps a
+// `TinyVec`, whose construction isn't const. They are computed once on first
+// access via `OnceLock` and reused thereafter.
+
+pub(crate) fn default_font_matrix() -> &'static [Operand; 6] {
+    static V: OnceLock<[Operand; 6]> = OnceLock::new();
+    V.get_or_init(|| {
+        let real_0_001 = Operand::Real(Real(tiny_vec![0x0a, 0x00, 0x1f])); // 0.001
+        [
+            real_0_001.clone(),
+            Operand::Integer(0),
+            Operand::Integer(0),
+            real_0_001,
+            Operand::Integer(0),
+            Operand::Integer(0),
+        ]
+    })
+}
+
+pub(crate) fn default_blue_scale() -> &'static [Operand; 1] {
+    static V: OnceLock<[Operand; 1]> = OnceLock::new();
+    V.get_or_init(|| [Operand::Real(Real(tiny_vec![0x0a, 0x03, 0x96, 0x25, 0xff]))]) // 0.039625
+}
+
+pub(crate) fn default_expansion_factor() -> &'static [Operand; 1] {
+    static V: OnceLock<[Operand; 1]> = OnceLock::new();
+    V.get_or_init(|| [Operand::Real(Real(tiny_vec![0x0a, 0x06, 0xff]))]) // 0.06
 }
 
 const ISO_ADOBE_LAST_SID: u16 = 228;
@@ -542,7 +549,7 @@ impl<'a> WriteBinary<&Self> for CFF<'a> {
     fn write<C: WriteContext>(ctxt: &mut C, cff: &CFF<'a>) -> Result<(), WriteError> {
         Header::write(ctxt, &cff.header)?;
         MaybeOwnedIndex::write16(ctxt, &cff.name_index)?;
-        let top_dicts = cff.fonts.iter().map(|font| &font.top_dict).collect_vec();
+        let top_dicts = cff.fonts.iter().map(|font| &font.top_dict).collect::<Vec<_>>();
         let top_dict_index_length =
             Index::calculate_size::<TopDict, _>(top_dicts.as_slice(), DictDelta::new())?;
         let top_dict_index_placeholder = ctxt.reserve::<IndexU16, _>(top_dict_index_length)?;
@@ -1078,7 +1085,7 @@ impl WriteBinary for Range<SID, u16> {
 
 impl<F, N> Range<F, N>
 where
-    N: num::Unsigned + Copy,
+    N: Copy,
     usize: From<N>,
 {
     pub fn len(&self) -> usize {
@@ -1296,8 +1303,8 @@ impl<'a> CustomCharset<'a> {
         sid: SID,
     ) -> Option<u16>
     where
-        F: num::Unsigned + Copy,
-        N: num::Unsigned + Copy,
+        F: Copy,
+        N: Copy,
         u32: From<N> + From<F>,
         u16: From<N> + From<F>,
         Range<F, N>: ReadFrom,
@@ -1321,8 +1328,8 @@ impl<'a> CustomCharset<'a> {
         glyph_id: u16,
     ) -> Option<u16>
     where
-        F: num::Unsigned + Copy,
-        N: num::Unsigned + Copy,
+        F: Copy,
+        N: Copy,
         usize: From<N> + From<F>,
         Range<F, N>: ReadFrom,
         <Range<F, N> as ReadUnchecked>::HostType: Copy,
@@ -1448,14 +1455,17 @@ impl FDSelect<'_> {
                 glyph_font_dict_indices,
             } => glyph_font_dict_indices.get_item(index),
             FDSelect::Format3 { ranges, sentinel } => {
-                #[rustfmt::skip]
-                let range_windows = ranges
+                let mut iter = ranges
                     .iter()
                     .map(|Range { first, n_left }| (first, Some(n_left)))
                     .chain(iter::once((*sentinel, None)))
-                    .tuple_windows();
+                    .peekable();
 
-                for ((first, fd_index), (last, _)) in range_windows {
+                while let Some((first, fd_index)) = iter.next() {
+                    let &(last, _) = match iter.peek() {
+                        Some(next) => next,
+                        None => break,
+                    };
                     if glyph_id >= first && glyph_id < last {
                         return fd_index;
                     }
@@ -1470,9 +1480,14 @@ impl FDSelect<'_> {
 impl<'a> Index<'a> {
     fn read_object(&self, index: usize) -> Option<&[u8]> {
         if index < self.count {
-            let start_index = lookup_offset_index(self.off_size, self.offset_array, index) - 1;
-            let end_index = lookup_offset_index(self.off_size, self.offset_array, index + 1) - 1;
-            Some(&self.data_array[start_index..end_index])
+            // The offsets are 1-based and only the last one is checked when the INDEX is
+            // read, so a corrupt font can hold 0, a start after the end, or an end past
+            // the data. Such an object does not exist.
+            let start_index =
+                lookup_offset_index(self.off_size, self.offset_array, index).checked_sub(1)?;
+            let end_index =
+                lookup_offset_index(self.off_size, self.offset_array, index + 1).checked_sub(1)?;
+            self.data_array.get(start_index..end_index)
         } else {
             None
         }
@@ -1488,8 +1503,9 @@ impl<'a> Index<'a> {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> {
-        // NOTE(unwrap): Safe since we're iterating over valid indices
-        (0..self.count).map(move |i| self.read_object(i).unwrap())
+        // An object that is not valid (see `read_object`) is empty, so the indices of the
+        // other objects stay the same.
+        (0..self.count).map(move |i| self.read_object(i).unwrap_or_default())
     }
 
     /// Returns the length required to write `objects`.
@@ -1656,7 +1672,7 @@ impl DictDefault for TopDictDefault {
             Operator::UnderlineThickness => Some(&DEFAULT_UNDERLINE_THICKNESS),
             Operator::PaintType => Some(&OPERAND_ZERO),
             Operator::CharstringType => Some(&DEFAULT_CHARSTRING_TYPE),
-            Operator::FontMatrix => Some(DEFAULT_FONT_MATRIX.as_ref()),
+            Operator::FontMatrix => Some(default_font_matrix().as_ref()),
             Operator::FontBBox => Some(&DEFAULT_BBOX),
             Operator::StrokeWidth => Some(&OPERAND_ZERO),
             Operator::Charset => Some(&OFFSET_ZERO),
@@ -1679,12 +1695,12 @@ impl DictDefault for FontDictDefault {
 impl DictDefault for PrivateDictDefault {
     fn default(op: Operator) -> Option<&'static [Operand]> {
         match op {
-            Operator::BlueScale => Some(DEFAULT_BLUE_SCALE.as_ref()),
+            Operator::BlueScale => Some(default_blue_scale().as_ref()),
             Operator::BlueShift => Some(&DEFAULT_BLUE_SHIFT),
             Operator::BlueFuzz => Some(&DEFAULT_BLUE_FUZZ),
             Operator::ForceBold => Some(&OPERAND_ZERO),
             Operator::LanguageGroup => Some(&OPERAND_ZERO),
-            Operator::ExpansionFactor => Some(DEFAULT_EXPANSION_FACTOR.as_ref()),
+            Operator::ExpansionFactor => Some(default_expansion_factor().as_ref()),
             Operator::InitialRandomSeed => Some(&OPERAND_ZERO),
             Operator::StrokeWidth => Some(&OPERAND_ZERO),
             Operator::DefaultWidthX => Some(&OPERAND_ZERO),
@@ -2109,9 +2125,9 @@ fn lookup_offset_index(off_size: u8, offset_array: &[u8], index: usize) -> usize
     let buf = &offset_array[index * usize::from(off_size)..];
     match off_size {
         1 => buf[0] as usize,
-        2 => BigEndian::read_u16(buf) as usize,
-        3 => BigEndian::read_u24(buf) as usize,
-        4 => BigEndian::read_u32(buf) as usize,
+        2 => u16::from_be_bytes([buf[0], buf[1]]) as usize,
+        3 => u32::from_be_bytes([0, buf[0], buf[1], buf[2]]) as usize,
+        4 => u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize,
         _ => panic!("unexpected off_size"),
     }
 }
@@ -2123,7 +2139,7 @@ fn read_range_array<'a, F, N>(
 where
     Range<F, N>: ReadFrom,
     usize: From<N>,
-    N: num::Unsigned + Copy,
+    N: Copy,
 {
     let mut peek = ctxt.scope().ctxt();
     let mut range_count = 0;
@@ -3371,6 +3387,67 @@ mod tests {
         );
     }
 
+    /// The objects of an INDEX with 1 byte offsets. `data` holds `last offset - 1` bytes, as
+    /// `read_index` requires, but the other offsets are not checked there.
+    fn index_objects(offsets: &[u8], data: &[u8]) -> Vec<Option<Vec<u8>>> {
+        let index = Index {
+            count: offsets.len() - 1,
+            off_size: 1,
+            offset_array: offsets,
+            data_array: data,
+        };
+        (0..index.count)
+            .map(|i| index.read_object(i).map(<[u8]>::to_vec))
+            .collect()
+    }
+
+    #[test]
+    fn index_with_valid_offsets() {
+        assert_eq!(
+            index_objects(&[1, 2, 3], &[4, 5]),
+            vec![Some(vec![4]), Some(vec![5])]
+        );
+    }
+
+    #[test]
+    fn index_object_with_offset_zero_is_missing() {
+        // Offsets are 1-based: 0 made `offset - 1` overflow.
+        assert_eq!(
+            index_objects(&[0, 1, 3], &[4, 5]),
+            vec![None, Some(vec![4, 5])]
+        );
+    }
+
+    #[test]
+    fn index_object_with_start_after_end_is_missing() {
+        // The first object would run from 2 to 0 (after the -1): the range was sliced.
+        assert_eq!(
+            index_objects(&[3, 1, 3], &[4, 5]),
+            vec![None, Some(vec![4, 5])]
+        );
+    }
+
+    #[test]
+    fn index_object_that_ends_past_the_data_is_missing() {
+        // The data holds 2 bytes (last offset 3). The first object ends at 8, the second
+        // starts there.
+        assert_eq!(index_objects(&[1, 9, 3], &[4, 5]), vec![None, None]);
+    }
+
+    #[test]
+    fn iterating_a_corrupt_index_gives_empty_objects() {
+        let offsets = [0, 1, 3];
+        let data = [4, 5];
+        let index = Index {
+            count: 2,
+            off_size: 1,
+            offset_array: &offsets,
+            data_array: &data,
+        };
+        let objects: Vec<&[u8]> = index.iter().collect();
+        assert_eq!(objects, vec![&[][..], &[4, 5][..]]);
+    }
+
     #[test]
     fn test_iter_index() {
         let offset_array = [1, 2, 3];
@@ -3597,7 +3674,7 @@ mod tests {
         let format0_encoding = ctxt.read::<CustomEncoding<'_>>().unwrap();
         match format0_encoding {
             CustomEncoding::Format0 { codes } => {
-                assert_eq!(codes.iter().collect_vec(), vec![4, 5, 6])
+                assert_eq!(codes.iter().collect::<Vec<_>>(), vec![4, 5, 6])
             }
             _ => panic!("expected CustomEncoding::Format0 got something else"),
         }
@@ -3610,7 +3687,7 @@ mod tests {
         let format1_encoding = ctxt.read::<CustomEncoding<'_>>().unwrap();
         match format1_encoding {
             CustomEncoding::Format1 { ranges } => assert_eq!(
-                ranges.iter().collect_vec(),
+                ranges.iter().collect::<Vec<_>>(),
                 vec![
                     Range {
                         first: 4,
@@ -3634,7 +3711,7 @@ mod tests {
         let format0_charset = ctxt.read_dep::<CustomCharset<'_>>(n_glyphs).unwrap();
         match format0_charset {
             CustomCharset::Format0 { glyphs } => {
-                assert_eq!(glyphs.iter().collect_vec(), vec![0xAABB])
+                assert_eq!(glyphs.iter().collect::<Vec<_>>(), vec![0xAABB])
             }
             _ => panic!("expected CustomCharset::Format0 got something else"),
         }
@@ -3648,7 +3725,7 @@ mod tests {
         let format1_charset = ctxt.read_dep::<CustomCharset<'_>>(n_glyphs).unwrap();
         match format1_charset {
             CustomCharset::Format1 { ranges } => assert_eq!(
-                ranges.iter().collect_vec(),
+                ranges.iter().collect::<Vec<_>>(),
                 vec![Range {
                     first: 1,
                     n_left: 3
@@ -3666,7 +3743,7 @@ mod tests {
         let format2_charset = ctxt.read_dep::<CustomCharset<'_>>(n_glyphs).unwrap();
         match format2_charset {
             CustomCharset::Format2 { ranges } => assert_eq!(
-                ranges.iter().collect_vec(),
+                ranges.iter().collect::<Vec<_>>(),
                 vec![Range {
                     first: 1,
                     n_left: 3
@@ -3884,7 +3961,7 @@ mod tests {
             Range { first: 2972, n_left: 2, },
         ]);
         let charset = CustomCharset::Format2 { ranges };
-        let actual = charset.iter().collect_vec();
+        let actual = charset.iter().collect::<Vec<_>>();
         let expected = vec![0, 111, 112, 113, 114, 115, 1, 2, 3, 4, 2972, 2973, 2974];
 
         assert_eq!(actual, expected);

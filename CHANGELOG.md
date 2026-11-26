@@ -6,11 +6,64 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 ## [Unreleased]
 
-## [0.16.1] - 2025-11-21
+### Changed
+
+- `variations::instance` varies the glyphs of a `glyf` font on up to eight threads when the font has 512 glyphs or
+  more (each glyph is varied on its own, so the font is the same bytes whatever the number of threads). A static
+  instance of macOS's `SFNS.ttf` (2,935 glyphs) takes 3.8 ms on eight cores instead of 9.0 ms.
+
+## [0.17.4] - 2026-11-21 (allsorts-azul)
+
+Panics on corrupt fonts, found by mutating font files. Each is an error now, or a
+missing object, and has a test.
+
+### Fixed
+
+- Fix a panic in `cff::Index` for an object with a bad offset. Offsets are 1-based and
+  only the last one was checked, so an offset of 0 overflowed, and a start after the end
+  or an end past the data sliced out of range. Such an object is missing, and iterating
+  the INDEX gives an empty object for it.
+- Fix a panic in `Font::cmap_subtable_data` when the cmap record that was chosen points
+  past the cmap table. `Font::new` returns `ParseError::BadOffset` for that font.
+- Fix an overflow in `subset` for a font whose `numberOfHMetrics` is 0: it subtracted 1
+  from it. The subset returns an error.
+
+## [0.17.3] - 2026-11-20 (allsorts-azul)
+
+Azul's fork, `allsorts-azul` 0.17.3 (upstream 0.17.0 plus the fork's changes).
+
+### Fixed
+
+- Fix a composite glyph's component that is itself composite losing the offset and
+  scale that placed it: the nested component was drawn at its own origin, so the
+  accents of `Ö` and `ü` in Barlow sat left of the letter instead of over it.
+- Indic: a multi-part vowel sign that was not decomposed (text that was not
+  preprocessed) takes the position of its last part, as in HarfBuzz, instead of
+  reaching the mark tagging without a position and panicking (Bengali "যশোর"; the
+  same signs of Oriya, Tamil, Telugu, Kannada, Malayalam and Sinhala).
+
+## [0.17.0] - 2026-05-07
+
+### Added
+
+- Support the flate2 zlib-rs backend.
+- Support for shaping Mongolian and Tibetan text.
 
 ### Changed
 
-- Switch from bitflags to enumflags2.
+- Make `DynamicFontTableProvider` `Send + Sync`.
+- Custom shaping features can be enabled independently of default features.
+- Enable `CCMP`, `RLIG`, and `LOCL` features by default when applying glyph
+  substitutions.
+- Apply Arabic Mark Transient Reordering Algorithm (AMTRA) to Syriac text.
+- Migrate from bitflags to enumflags2.
+
+### Fixed
+
+- Fix `UseMarkFilteringSet` lookup flag skipping all non-mark glyphs.
+- Fix panic in subsetting when `CMAP` mappings to keep ends up empty.
+
+## [0.16.1] - 2025-11-21
 
 ### Fixed
 
@@ -313,7 +366,8 @@ format is based on [Keep a Changelog], and this project aims to follow
 
 - Initial release
 
-[Unreleased]: https://github.com/yeslogic/allsorts/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/yeslogic/allsorts/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/yeslogic/allsorts/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/yeslogic/allsorts/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/yeslogic/allsorts/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/yeslogic/allsorts/compare/v0.14.2...v0.15.0

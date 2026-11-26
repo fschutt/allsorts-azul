@@ -243,6 +243,12 @@ impl<T: FontTableProvider> Font<T> {
 
         match charmap_info(&cmap_table)? {
             Some((cmap_subtable_encoding, cmap_subtable_offset)) => {
+                // The offset comes from an encoding record and `charmap_info` does not check
+                // it. A record that points past the table is corrupt.
+                let cmap_subtable_offset = usize::safe_from(cmap_subtable_offset);
+                if cmap_subtable_offset > cmap_table.len() {
+                    return Err(ParseError::BadOffset);
+                }
                 let head_table =
                     ReadScope::new(&provider.read_table_data(tag::HEAD)?).read::<HeadTable>()?;
                 let maxp_table =
@@ -277,7 +283,7 @@ impl<T: FontTableProvider> Font<T> {
                     hhea_table,
                     vmtx_table: LazyLoad::NotLoaded,
                     vhea_table: LazyLoad::NotLoaded,
-                    cmap_subtable_offset: usize::safe_from(cmap_subtable_offset),
+                    cmap_subtable_offset,
                     cmap_subtable_encoding,
                     gdef_cache: LazyLoad::NotLoaded,
                     morx_cache: LazyLoad::NotLoaded,
@@ -1210,7 +1216,10 @@ impl<T: FontTableProvider> Font<T> {
     }
 
     pub fn cmap_subtable_data(&self) -> &[u8] {
-        &self.cmap_table[self.cmap_subtable_offset..]
+        // `Font::new` checks the offset, `get` keeps this from panicking if that changes.
+        self.cmap_table
+            .get(self.cmap_subtable_offset..)
+            .unwrap_or_default()
     }
 }
 
